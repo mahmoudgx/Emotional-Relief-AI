@@ -172,7 +172,7 @@ export default function ChatComponent() {
         <CardTitle className="text-blue-800">Chat with AI Assistant</CardTitle>
         {messageCount >= 2 && (
           <p className="text-sm font-medium text-amber-600 bg-amber-50 p-2 rounded-md mt-2 border border-amber-200">
-            You&aposve sent {messageCount} messages. Please sign in to continue
+            You&apos;ve sent {messageCount} messages. Please sign in to continue
             chatting.
           </p>
         )}

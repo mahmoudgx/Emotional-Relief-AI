@@ -73,8 +73,8 @@ export default function AboutPage() {
                 expressing negative emotions in a constructive way can help
                 reduce their intensity and impact. The AI is trained to respond
                 with empathy, ask helpful questions, and guide users toward
-                insights about their emotions without trying to &quotfix&quot or
-                dismiss their feelings.
+                insights about their emotions without trying to &quot;fix&quot;
+                or dismiss their feelings.
               </p>
             </CardContent>
           </Card>
@@ -98,7 +98,7 @@ export default function AboutPage() {
           <Card>
             <CardHeader>
               <CardTitle>Contact Us</CardTitle>
-              <CardDescription>We&aposd love to hear from you</CardDescription>
+              <CardDescription>We&apos;d love to hear from you</CardDescription>
             </CardHeader>
             <CardContent>
               <p className="text-muted-foreground leading-7">
@@ -107,7 +107,7 @@ export default function AboutPage() {
                 <span className="text-primary">
                   support@emotionalreliefai.com
                 </span>
-                . We&aposre constantly working to improve our service and value
+                . We&apos;re constantly working to improve our service and value
                 your input.
               </p>
             </CardContent>
