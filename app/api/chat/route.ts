@@ -93,10 +93,21 @@ export async function POST(req: NextRequest) {
     const aiResponse = await generateChatResponse(formattedMessages);
 
     // Save AI response to database
+    let content = '';
+
+    // Check the type of content block and extract text accordingly
+    if (aiResponse.content[0].type === 'text') {
+      content = aiResponse.content[0].text;
+    } else {
+      // Handle other content types if needed
+      console.warn('Unexpected content type:', aiResponse.content[0].type);
+      content = JSON.stringify(aiResponse.content[0]);
+    }
+
     const savedAiMessage = await prisma.message.create({
       data: {
         chatSessionId: chatSession!.id,
-        content: aiResponse.content[0].text,
+        content: content,
         role: 'assistant',
       },
     });

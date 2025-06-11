@@ -17,9 +17,9 @@ export async function GET(req: NextRequest) {
     }
 
     // Format messages for AI API - for guest users, we don't maintain conversation history
-    const formattedMessages = [
+    const formattedMessages: { role: "user" | "assistant"; content: string; }[] = [
       {
-        role: 'user',
+        role: 'user' as const,
         content: message
       }
     ];
@@ -45,13 +45,23 @@ export async function GET(req: NextRequest) {
           for await (const chunk of aiStream) {
             console.log('Received chunk from AI:', chunk);
             if (chunk.type === 'content_block_delta') {
-              fullContent += chunk.delta.text;
+              let content = '';
+
+              // Handle different delta types
+              if (chunk.delta.type === 'text_delta') {
+                content = chunk.delta.text;
+                fullContent += content;
+              } else if (chunk.delta.type === 'input_json_delta') {
+                content = chunk.delta.partial_json;
+                fullContent += content;
+              }
+
               chunkCount++;
 
               // Send the chunk to the client
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                 messageId: 'guest-' + Date.now(),
-                content: chunk.delta.text,
+                content: content,
                 done: false
               })}\n\n`));
             }
