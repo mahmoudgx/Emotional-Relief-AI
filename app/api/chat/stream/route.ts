@@ -1,0 +1,399 @@
+import { NextRequest } from 'next/server';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/app/api/auth/[...nextauth]/route';
+import { prisma } from '@/app/lib/prisma';
+import { streamChatResponseWithDelay } from '@/app/lib/delayedStream';
+
+export async function POST(req: NextRequest) {
+  try {
+    console.warn('POST /api/chat/stream is deprecated. Use GET with query parameters instead.');
+
+    const session = await getServerSession(authOptions);
+
+    if (!session || !session.user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    const { message, chatSessionId } = await req.json();
+
+    if (!message) {
+      return new Response(JSON.stringify({ error: 'Message is required' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    let chatSession;
+
+    // If chatSessionId is provided, find the existing chat session
+    if (chatSessionId) {
+      chatSession = await prisma.chatSession.findUnique({
+        where: {
+          id: chatSessionId,
+          userId: session.user.id,
+        },
+        include: {
+          messages: {
+            orderBy: {
+              createdAt: 'asc',
+            },
+          },
+        },
+      });
+
+      if (!chatSession) {
+        return new Response(JSON.stringify({ error: 'Chat session not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    } else {
+      // Create a new chat session
+      chatSession = await prisma.chatSession.create({
+        data: {
+          userId: session.user.id,
+          title: message.substring(0, 30) + (message.length > 30 ? '...' : ''),
+          messages: {
+            create: {
+              content: message,
+              role: 'user',
+            },
+          },
+        },
+        include: {
+          messages: true,
+        },
+      });
+    }
+
+    // If it's an existing session, add the new user message
+    if (chatSessionId) {
+      await prisma.message.create({
+        data: {
+          chatSessionId: chatSession.id,
+          content: message,
+          role: 'user',
+        },
+      });
+
+      // Refresh the messages
+      chatSession = await prisma.chatSession.findUnique({
+        where: {
+          id: chatSession.id,
+        },
+        include: {
+          messages: {
+            orderBy: {
+              createdAt: 'asc',
+            },
+          },
+        },
+      });
+    }
+
+    // Format messages for Anthropic API
+    const formattedMessages = chatSession!.messages.map((msg) => ({
+      role: msg.role as 'user' | 'assistant',
+      content: msg.content,
+    }));
+
+    // Create a new message in the database for the assistant's response
+    const aiMessage = await prisma.message.create({
+      data: {
+        chatSessionId: chatSession!.id,
+        content: '', // Start with empty content, will be updated as we receive chunks
+        role: 'assistant',
+      },
+    });
+
+    // Set up Server-Sent Events
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          // Send the initial message with the chat session ID and message ID
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            chatSessionId: chatSession!.id,
+            messageId: aiMessage.id,
+            content: '',
+            done: false
+          })}\n\n`));
+
+          // Stream the AI response
+          console.log('Starting to stream AI response');
+          const aiStream = await streamChatResponseWithDelay(formattedMessages);
+          let fullContent = '';
+          let chunkCount = 0;
+
+          for await (const chunk of aiStream) {
+            console.log('Received chunk from Anthropic:', chunk);
+            if (chunk.type === 'content_block_delta') {
+              fullContent += chunk.delta.text;
+              chunkCount++;
+
+              console.log(`Sending chunk #${chunkCount} to client:`, chunk.delta.text);
+
+              // Send the chunk to the client
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                chatSessionId: chatSession!.id,
+                messageId: aiMessage.id,
+                content: chunk.delta.text,
+                done: false
+              })}\n\n`));
+            }
+          }
+
+          console.log(`Streaming complete. Sent ${chunkCount} chunks. Full content length: ${fullContent.length}`);
+
+          // Update the message in the database with the full content
+          await prisma.message.update({
+            where: { id: aiMessage.id },
+            data: { content: fullContent },
+          });
+
+          // Send the final message
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            chatSessionId: chatSession!.id,
+            messageId: aiMessage.id,
+            content: '',
+            done: true
+          })}\n\n`));
+
+          controller.close();
+        } catch (error) {
+          console.error('Error streaming chat response:', error);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            error: 'An error occurred while streaming the response',
+            done: true
+          })}\n\n`));
+          controller.close();
+        }
+      }
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
+    });
+  } catch (error) {
+    console.error('Chat API error:', error);
+    return new Response(JSON.stringify({ error: 'An error occurred while processing your message' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
+
+export async function GET(req: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions);
+
+    if (!session || !session.user) {
+      return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
+    // Get message and chatSessionId from query parameters
+    const searchParams = req.nextUrl.searchParams;
+    const message = searchParams.get('message');
+    const chatSessionId = searchParams.get('chatSessionId');
+
+    console.log('GET request received with params:', { message, chatSessionId });
+
+    // If no message is provided, just establish a connection
+    if (!message) {
+      // Set up a simple SSE connection
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        start(controller) {
+          // Send an initial connection established message
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            message: 'Connection established',
+            done: false
+          })}\n\n`));
+
+          // Keep the connection open but don't send any more data
+        }
+      });
+
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive',
+        },
+      });
+    }
+
+    // Process the message (similar to POST handler)
+    let chatSession;
+
+    // If chatSessionId is provided, find the existing chat session
+    if (chatSessionId) {
+      chatSession = await prisma.chatSession.findUnique({
+        where: {
+          id: chatSessionId,
+          userId: session.user.id,
+        },
+        include: {
+          messages: {
+            orderBy: {
+              createdAt: 'asc',
+            },
+          },
+        },
+      });
+
+      if (!chatSession) {
+        return new Response(JSON.stringify({ error: 'Chat session not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    } else {
+      // Create a new chat session
+      chatSession = await prisma.chatSession.create({
+        data: {
+          userId: session.user.id,
+          title: message.substring(0, 30) + (message.length > 30 ? '...' : ''),
+          messages: {
+            create: {
+              content: message,
+              role: 'user',
+            },
+          },
+        },
+        include: {
+          messages: true,
+        },
+      });
+    }
+
+    // If it's an existing session, add the new user message
+    if (chatSessionId) {
+      await prisma.message.create({
+        data: {
+          chatSessionId: chatSession.id,
+          content: message,
+          role: 'user',
+        },
+      });
+
+      // Refresh the messages
+      chatSession = await prisma.chatSession.findUnique({
+        where: {
+          id: chatSession.id,
+        },
+        include: {
+          messages: {
+            orderBy: {
+              createdAt: 'asc',
+            },
+          },
+        },
+      });
+    }
+
+    // Format messages for Anthropic API
+    const formattedMessages = chatSession!.messages.map((msg) => ({
+      role: msg.role as 'user' | 'assistant',
+      content: msg.content,
+    }));
+
+    // Create a new message in the database for the assistant's response
+    const aiMessage = await prisma.message.create({
+      data: {
+        chatSessionId: chatSession!.id,
+        content: '', // Start with empty content, will be updated as we receive chunks
+        role: 'assistant',
+      },
+    });
+
+    // Set up Server-Sent Events
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      async start(controller) {
+        try {
+          // Send the initial message with the chat session ID and message ID
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            chatSessionId: chatSession!.id,
+            messageId: aiMessage.id,
+            content: '',
+            done: false
+          })}\n\n`));
+
+          // Stream the AI response
+          console.log('Starting to stream AI response');
+          const aiStream = await streamChatResponseWithDelay(formattedMessages);
+          let fullContent = '';
+          let chunkCount = 0;
+
+          for await (const chunk of aiStream) {
+            console.log('Received chunk from Anthropic:', chunk);
+            if (chunk.type === 'content_block_delta') {
+              fullContent += chunk.delta.text;
+              chunkCount++;
+
+              console.log(`Sending chunk #${chunkCount} to client:`, chunk.delta.text);
+
+              // Send the chunk to the client
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                chatSessionId: chatSession!.id,
+                messageId: aiMessage.id,
+                content: chunk.delta.text,
+                done: false
+              })}\n\n`));
+            }
+          }
+
+          console.log(`Streaming complete. Sent ${chunkCount} chunks. Full content length: ${fullContent.length}`);
+
+          // Update the message in the database with the full content
+          await prisma.message.update({
+            where: { id: aiMessage.id },
+            data: { content: fullContent },
+          });
+
+          // Send the final message
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            chatSessionId: chatSession!.id,
+            messageId: aiMessage.id,
+            content: '',
+            done: true
+          })}\n\n`));
+
+          controller.close();
+        } catch (error) {
+          console.error('Error streaming chat response:', error);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            error: 'An error occurred while streaming the response',
+            done: true
+          })}\n\n`));
+          controller.close();
+        }
+      }
+    });
+
+    return new Response(stream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+      },
+    });
+  } catch (error) {
+    console.error('Chat stream connection error:', error);
+    return new Response(JSON.stringify({ error: 'An error occurred while establishing the connection' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+}
